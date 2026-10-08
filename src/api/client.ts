@@ -33,10 +33,7 @@ export class ApiError extends Error {
   }
 }
 
-export async function apiClient<T>(
-  path: string,
-  options: RequestInit = {},
-): Promise<T> {
+function buildHeaders(options: RequestInit): Headers {
   const headers = new Headers(options.headers)
   if (!headers.has('Content-Type') && options.body) {
     headers.set('Content-Type', 'application/json')
@@ -45,30 +42,104 @@ export async function apiClient<T>(
   if (getSimulateApiError()) {
     headers.set('X-Simulate-Error', 'true')
   }
+  return headers
+}
 
-  const response = await fetch(`${API_BASE_URL}${path}`, {
-    ...options,
-    headers,
-  })
+function isMockMode(): boolean {
+  return !import.meta.env.VITE_API_BASE_URL
+}
 
-  if (!response.ok) {
-    let message = `Request failed (${response.status})`
-    let code: string | undefined
-    try {
-      const body = (await response.json()) as ApiErrorBody
-      message = body.message || message
-      code = body.code
-    } catch {
-      // ignore parse errors
-    }
-    throw new ApiError(message, response.status, code)
-  }
+function looksLikeHtml(contentType: string, bodyPreview: string): boolean {
+  if (contentType.includes('text/html')) return true
+  const trimmed = bodyPreview.trimStart().toLowerCase()
+  return trimmed.startsWith('<!doctype') || trimmed.startsWith('<html')
+}
 
+async function readJson<T>(response: Response): Promise<T> {
   if (response.status === 204) {
     return undefined as T
   }
 
-  return (await response.json()) as T
+  const contentType = response.headers.get('content-type') ?? ''
+  const text = await response.text()
+
+  if (looksLikeHtml(contentType, text)) {
+    throw new ApiError(
+      'API returned HTML instead of JSON. Mock layer is unavailable for this request.',
+      response.status,
+      'HTML_RESPONSE',
+    )
+  }
+
+  let data: unknown = undefined
+  if (text) {
+    try {
+      data = JSON.parse(text) as unknown
+    } catch {
+      throw new ApiError('Invalid JSON response from API', response.status, 'INVALID_JSON')
+    }
+  }
+
+  if (!response.ok) {
+    const body = data as ApiErrorBody | undefined
+    throw new ApiError(
+      body?.message || `Request failed (${response.status})`,
+      response.status,
+      body?.code,
+    )
+  }
+
+  return data as T
+}
+
+async function resolveWithHandlers<T>(
+  url: string,
+  init: RequestInit,
+): Promise<T> {
+  const [{ getResponse }, { handlers }] = await Promise.all([
+    import('msw'),
+    import('@/mocks/handlers'),
+  ])
+  const request = new Request(url, init)
+  const response = await getResponse(handlers, request)
+  if (!response) {
+    throw new ApiError(`No mock handler for ${url}`, 404, 'NO_HANDLER')
+  }
+  return readJson<T>(response)
+}
+
+export async function apiClient<T>(
+  path: string,
+  options: RequestInit = {},
+): Promise<T> {
+  const headers = buildHeaders(options)
+  const url = new URL(`${API_BASE_URL}${path}`, window.location.origin).toString()
+  const init: RequestInit = {
+    ...options,
+    headers,
+  }
+
+  if (!isMockMode()) {
+    const response = await fetch(url, init)
+    return readJson<T>(response)
+  }
+
+  // Prefer the MSW service worker when it is controlling the page.
+  // If the host SPA-fallback returns HTML (common before SW activation / on
+  // some static hosts), resolve the same handlers in-process via getResponse.
+  try {
+    const response = await fetch(url, init)
+    const preview = await response.clone().text()
+    const contentType = response.headers.get('content-type') ?? ''
+
+    if (!looksLikeHtml(contentType, preview)) {
+      return readJson<T>(response)
+    }
+  } catch {
+    // Fall through to in-process handlers.
+  }
+
+  return resolveWithHandlers<T>(url, init)
 }
 
 export function toQuery(params: Record<string, string | number | undefined>): string {

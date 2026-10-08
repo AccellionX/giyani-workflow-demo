@@ -43,7 +43,7 @@ Zero-config Vite deploy:
 3. Build command: `npm run build`
 4. Output directory: `dist`
 
-MSW’s service worker is copied to `public/mockServiceWorker.js` and started from `src/main.tsx` in every environment, so the production demo keeps working without a backend.
+MSW’s service worker is copied to `public/mockServiceWorker.js` and started from `src/main.tsx` in every environment. The API client also falls back to MSW’s in-process `getResponse()` against the same handlers if a host returns HTML for `/api/*` (common SPA fallback before the worker is controlling the page), so the production demo keeps working without a backend.
 
 ## Project structure
 
